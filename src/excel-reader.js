@@ -11,6 +11,11 @@ const CAP_RULES = {
   CARRETA: 28000
 }
 
+// limites de segurança para evitar travamento em planilhas "sujas"
+const MAX_HEADER_SCAN_ROWS = 20
+const MAX_SHEET_ROWS = 5000
+const MAX_SHEET_COLS = 80
+
 function normalizeText(value) {
   return String(value ?? '').trim()
 }
@@ -34,10 +39,53 @@ function classifySheet(name) {
   return 'IGNORAR'
 }
 
+function clampSheetRange(sheet, sheetName = 'ABA') {
+  if (!sheet || !sheet['!ref']) {
+    console.warn(`[excel-reader] Aba ${sheetName} sem !ref válido`)
+    return sheet
+  }
+
+  try {
+    const originalRef = sheet['!ref']
+    const range = XLSX.utils.decode_range(originalRef)
+
+    const originalRows = range.e.r - range.s.r + 1
+    const originalCols = range.e.c - range.s.c + 1
+
+    let changed = false
+
+    if (originalRows > MAX_SHEET_ROWS) {
+      range.e.r = range.s.r + MAX_SHEET_ROWS - 1
+      changed = true
+    }
+
+    if (originalCols > MAX_SHEET_COLS) {
+      range.e.c = range.s.c + MAX_SHEET_COLS - 1
+      changed = true
+    }
+
+    if (changed) {
+      sheet['!ref'] = XLSX.utils.encode_range(range)
+      console.warn(
+        `[excel-reader] Aba ${sheetName} com range ajustado de ${originalRef} para ${sheet['!ref']}`
+      )
+    } else {
+      console.log(
+        `[excel-reader] Aba ${sheetName} dentro do limite: ${originalRef}`
+      )
+    }
+  } catch (error) {
+    console.error(`[excel-reader] Erro ao ajustar range da aba ${sheetName}:`, error)
+  }
+
+  return sheet
+}
+
 function detectHeaderRow(sheet) {
   const rows = XLSX.utils.sheet_to_json(sheet, {
     header: 1,
-    defval: ''
+    defval: null,
+    blankrows: false
   })
 
   let bestIndex = 0
@@ -57,8 +105,10 @@ function detectHeaderRow(sheet) {
     'OCIOSIDADE'
   ]
 
-  for (let i = 0; i < Math.min(rows.length, 15); i++) {
-    const row = rows[i].map(normalizeHeader)
+  const scanLimit = Math.min(rows.length, MAX_HEADER_SCAN_ROWS)
+
+  for (let i = 0; i < scanLimit; i++) {
+    const row = Array.isArray(rows[i]) ? rows[i].map(normalizeHeader) : []
     const score = expected.filter((item) => row.includes(item)).length
 
     if (score > bestScore) {
@@ -67,17 +117,34 @@ function detectHeaderRow(sheet) {
     }
   }
 
+  console.log(
+    `[excel-reader] Cabeçalho detectado na linha ${bestIndex + 1} (score ${bestScore})`
+  )
+
   return bestIndex
 }
 
-function sheetToObjects(sheet) {
-  const headerRow = detectHeaderRow(sheet)
+function sheetToObjects(sheet, sheetName = 'ABA') {
+  if (!sheet || !sheet['!ref']) {
+    console.warn(`[excel-reader] sheetToObjects ignorou aba ${sheetName} sem !ref`)
+    return []
+  }
 
-  return XLSX.utils.sheet_to_json(sheet, {
+  const safeSheet = clampSheetRange(sheet, sheetName)
+  const headerRow = detectHeaderRow(safeSheet)
+
+  const rows = XLSX.utils.sheet_to_json(safeSheet, {
     defval: null,
     range: headerRow,
-    raw: true
+    raw: true,
+    blankrows: false
   })
+
+  console.log(
+    `[excel-reader] ${sheetName}: ${rows.length} linhas convertidas para objetos`
+  )
+
+  return rows
 }
 
 function getValue(row, aliases = []) {
@@ -112,6 +179,8 @@ function parseDateString(str) {
   const value = String(str).trim()
   if (!value) return null
 
+  if (value === '*' || value === '-' || value === '--') return null
+
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value
 
   if (/^\d{2}\/\d{2}\/\d{4}$/.test(value)) {
@@ -140,7 +209,7 @@ function toDateString(value) {
   }
 
   const parsed = parseDateString(value)
-  return parsed || String(value).trim()
+  return parsed
 }
 
 function toText(value) {
@@ -337,12 +406,18 @@ function mapOciosidadeRow(row, filial, origemAba) {
 }
 
 export async function readExcelFile(file, filial) {
+  console.log('[excel-reader] Início da leitura do arquivo:', file?.name)
+
   const buffer = await file.arrayBuffer()
+  console.log('[excel-reader] Buffer carregado. Tamanho:', buffer.byteLength)
+
   const workbook = XLSX.read(buffer, {
     type: 'array',
     cellDates: false,
     raw: true
   })
+
+  console.log('[excel-reader] Abas encontradas:', workbook.SheetNames)
 
   const sheets = []
   const fretes = []
@@ -352,10 +427,25 @@ export async function readExcelFile(file, filial) {
   workbook.SheetNames.forEach((sheetName) => {
     const type = classifySheet(sheetName)
 
+    console.log(`[excel-reader] Avaliando aba: ${sheetName} -> ${type}`)
+
     if (type === 'IGNORAR') return
 
     const sheet = workbook.Sheets[sheetName]
-    const rows = sheetToObjects(sheet)
+
+    if (!sheet || !sheet['!ref']) {
+      console.warn(`[excel-reader] Aba ${sheetName} ignorada por não possuir !ref`)
+      sheets.push({
+        name: sheetName,
+        type,
+        totalRows: 0,
+        ignored: true,
+        reason: 'Sem range válido'
+      })
+      return
+    }
+
+    const rows = sheetToObjects(sheet, sheetName)
 
     sheets.push({
       name: sheetName,
@@ -383,6 +473,13 @@ export async function readExcelFile(file, filial) {
         .map((row) => mapOciosidadeRow(row, filial, sheetName))
         .forEach((item) => ociosidade.push(item))
     }
+  })
+
+  console.log('[excel-reader] Resumo final:', {
+    sheets,
+    fretes: fretes.length,
+    custoFrota: custoFrota.length,
+    ociosidade: ociosidade.length
   })
 
   return {
