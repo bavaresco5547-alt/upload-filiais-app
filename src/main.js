@@ -25,6 +25,7 @@ document.getElementById('app').innerHTML = `
         <option value="HORIZONTE">HORIZONTE</option>
         <option value="CURITIBA">CURITIBA</option>
         <option value="CAMPINAS">CAMPINAS</option>
+        <option value="CAMPINAS">CAJURU</option>
       </select>
 
       <label for="fileInput">Planilha Excel</label>
